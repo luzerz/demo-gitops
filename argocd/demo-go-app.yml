@@ -1,0 +1,20 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: demo-go-app
+  namespace: argocd
+spec:
+  project: default  # The ArgoCD project to which this application belongs
+  source:
+    repoURL: git@github.com:luzerz/demo-gitops.git  # Replace with your repository URL
+    targetRevision: main  # Replace with a specific branch, tag, or commit SHA if needed
+    path: helm/demo-go-app  # Path to the directory containing the Kubernetes manifests in the repo
+  destination:
+    server: https://kubernetes.default.svc  # Kubernetes cluster API server
+    namespace: app-dev  # Target namespace for the application resources
+  syncPolicy:
+    automated:
+      prune: true  # Automatically delete resources not defined in the Git repo
+      selfHeal: true  # Automatically sync when drift is detected
+    syncOptions:
+    - CreateNamespace=true  # Automatically create the namespace if it does not exist

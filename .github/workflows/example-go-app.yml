@@ -1,0 +1,26 @@
+name: "Development Deployment"
+on:
+    workflow_dispatch:
+    pull_request:
+      branches: [ "main" ]
+permissions:
+  id-token: write # This is required for requesting the JWT
+  contents: write # This is required for actions/checkout
+  actions: read
+  packages: write
+  security-events: write
+  issues: write
+  checks: write
+jobs:
+    Development:
+        uses: luzerz/demo-gitops/.github/workflows/shared.yml@main
+        with:
+            golang: true
+            go_version: "1.23"
+            unittest: true
+            code_scan_severity: "HIGH,CRITICAL"
+            code_scan_scanners: "vuln,secret,misconfig"
+            image_scan_severity: "HIGH,CRITICAL"
+            image_scan_scanners: "vuln,secret"
+        secrets:
+           cd_pat: ${{ secrets.PAT }}    

@@ -1,0 +1,208 @@
+name: "Develop Deployment"
+on:
+    workflow_call:
+        inputs:
+            golang:
+                type: boolean
+                default: false
+            go_version:
+                type: string
+                default: "1.23"    
+            nodejs:
+                type: boolean
+                default: false
+            node_version:
+                type: string
+                default: "18.20.2"    
+            unittest:
+                type: boolean
+                default: true
+            image_scan:
+                type: boolean
+                default: true    
+            image_scan_scanners:
+                type: string
+                required: false
+                default: 'vuln,secret,misconfig' 
+            image_scan_severity:
+                type: string
+                required: false
+                default: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+            image_scan_vuln-type:
+                type: string
+                required: false
+                default: 'library'    
+            code_scan_scanners:
+                type: string
+                required: false
+                default: 'vuln,secret,misconfig'    
+            code_scan_vuln-type:
+                type: string
+                required: false
+                default: 'library'
+            code_scan_severity:
+                type: string
+                required: false
+                default: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+        secrets:        
+            cd_pat:
+                required: true
+
+
+permissions:
+    id-token: write 
+    contents: write 
+    actions: read
+    security-events: write
+    issues: write
+    checks: write
+    packages: write                   
+jobs:
+    NodeUnittest:
+        name: NodeJs Unittest
+        if: ${{ inputs.nodejs == true && inputs.unittest == true }} 
+        runs-on: ubuntu-24.04
+        steps:
+            - uses: actions/checkout@v4
+            - name: Use Node.js ${{ inputs.node_version }}
+              uses: actions/setup-node@v4
+              with:
+                node-version: ${{ inputs.node_version }} 
+            - name: Test with npm
+              id: unittest_frontend
+              run: |
+                  npm install
+                  npm ci
+                  npm run build --if-present
+                  npm run test 
+    GOUnitTest:
+        name: Go Uniitest
+        if: ${{ inputs.golang == true && inputs.unittest == true }} 
+        runs-on: ubuntu-24.04
+        steps:
+            - uses: actions/checkout@v4
+            - name: Set up Go
+              uses: actions/setup-go@v5
+              with:
+                go-version: ${{ inputs.go_version }}
+            - name: Unittest
+              id: unittest
+              run: |
+                  go mod tidy
+                  go test -v "./..." -coverprofile="coverage.out" -covermode=count -json > report.json
+                  go tool cover -html=coverage.out -o report.html
+                  echo "Quality Gate: checking test coverage is above threshold ..."
+                  echo "Threshold             : $TESTCOVERAGE_THRESHOLD %"
+                  totalCoverage=`go tool cover -func=coverage.out | grep total | grep -Eo '[0-9]+\.[0-9]+'`
+                  echo "Current test coverage : $totalCoverage %"
+                  if (( $(printf "$totalCoverage $TESTCOVERAGE_THRESHOLD" | awk '{print ($1 >= $2)}') )); then
+                      echo "OK"
+                  else
+                      echo "Current test coverage is below threshold. Please add more unit tests or adjust threshold to a lower value."
+                      echo "Failed"
+                      exit 1
+                  fi 
+    CodeScan:
+        runs-on: ubuntu-24.04
+        name: CodeScan
+        steps:
+          - uses: actions/checkout@v4
+          - name: Run Trivy vulnerability scanner
+            id: codescan
+            uses: aquasecurity/trivy-action@master
+            with:
+                format: 'sarif'
+                scan-type: 'fs'
+                scan-ref: '.'
+                exit-code: '1'
+                ignore-unfixed: true
+                vuln-type: '${{ inputs.code_scan_vuln-type }}'
+                severity: '${{ inputs.code_scan_severity }}'
+                scanners: '${{ inputs.code_scan_scanners }}'
+                output: 'trivy-codescan-results.sarif'
+                skip-files: 'Dockerfile'
+          - name: "Upload Trivy scan results to GitHub Artifact"
+            uses: actions/upload-artifact@v4
+            if: ${{ always() }}
+            with:
+                name: trivy-codescan-results.sarif
+                path: ./trivy-codescan-results.sarif
+                if-no-files-found: error
+                retention-days: 1
+    DockerBuild:
+        name: "Build Images & Push" 
+        runs-on: ubuntu-24.04
+        outputs:
+            version: ${{ steps.git-version.outputs.VERSION }}
+        steps:
+            - uses: actions/checkout@v4
+            - name: 'Docker Login'
+              uses: docker/login-action@v2
+              with:
+                registry: ghcr.io
+                username: ${{ github.actor }}
+                password: ${{ secrets.GITHUB_TOKEN }}
+            - name: Get short Git SHA
+              id: git-version
+              run: echo VERSION=$(git rev-parse --short=7 HEAD) >> $GITHUB_OUTPUT    
+            - name: Build Docker image
+              run: |
+                  docker build -t  ghcr.io/${{ github.repository_owner }}/${{ github.repository }}:${{ steps.git-version.outputs.VERSION }} .   
+            - name: Run Trivy image scanner
+              if: ${{ inputs.image_scan == true }}     
+              id: imagescan
+              uses: aquasecurity/trivy-action@master
+              with:
+                format: 'sarif'
+                image-ref:  ghcr.io/${{ github.repository_owner }}/${{ github.repository }}:${{ steps.git-version.outputs.VERSION }}
+                scan-type: 'image'
+                exit-code: '1' # Default = 1
+                vuln-type: '${{ inputs.image_scan_vuln-type }}'
+                severity: '${{ inputs.image_scan_severity }}'
+                scanners: '${{ inputs.image_scan_scanners }}'
+                output: 'trivy-imagescan-results.sarif'
+            - name: "Upload Trivy scan results to GitHub Artifact"
+              uses: actions/upload-artifact@v4
+              if: |
+                (success() || failure()) && !(steps.imagescan.conclusion == 'skipped')
+              with:
+                name: trivy-imagescan-results.sarif
+                path: ./trivy-imagescan-results.sarif
+                if-no-files-found: error
+                retention-days: 1 
+            - name: Push Docker image to GHCR
+              run: |
+                docker push ghcr.io/${{ github.repository_owner }}/${{ github.repository }}:${{ steps.git-version.outputs.VERSION }}
+    
+    Deploy:
+        runs-on: ubuntu-24.04
+        name: Deploy to Kubernetes cluster via argoCD
+        needs: DockerBuild
+        if: ${{ needs.DockerBuild.result == 'success' }}
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                repository: luzerz/demo-gitops
+                token: ${{ secrets.cd_pat }}
+                ref: "main"
+            - name: Get short Git SHA
+              id: git-info
+              run: echo "short_sha=$(git rev-parse --short=7 HEAD)" >> $GITHUB_ENV   
+            - name: Install yq command
+              run: |
+                sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+                sudo chmod a+x /usr/local/bin/yq
+                yq --version
+            - name: Extract repository name
+              run: echo "REPO_NAME=${GITHUB_REPOSITORY##*/}" >> $GITHUB_ENV
+            - name: Update image version
+              run: |
+                yq -i e '.image.tag="${{ needs.DockerBuild.outputs.version }}"' ./helm/${{ env.REPO_NAME }}/values.yaml
+
+            - name: Commit & Push changes
+              run: |
+                git config --global user.email 'DevOps'
+                git config --global user.name  'devops@luzerz.com'
+                git add .
+                git commit -m "CD deployment with tag ${{ needs.DockerBuild.outputs.version }}"
+                git push https://${{ secrets.cd_pat }}@github.com/luzerz/demo-gitops.git --force      
