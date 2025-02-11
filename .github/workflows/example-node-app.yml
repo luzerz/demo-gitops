@@ -13,7 +13,7 @@ permissions:
   checks: write
 jobs:
     Development:
-        uses: luzerz/demo-gitops/.github/workflows/deploy.yml@main
+        uses: luzerz/demo-gitops/.github/workflows/shared.yml@main
         with:
             nodejs: true
             node_version: "18.20.2"
